@@ -1,0 +1,358 @@
+# train_malaria.py
+# ==========================================================
+# FULLY UPDATED & OPTIMISED — TF 2.15 COMPATIBLE
+# Target: Windows, 16GB RAM, integrated graphics (CPU only)
+# ==========================================================
+
+import os
+import pathlib
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_curve,
+    auc,
+    precision_recall_curve,
+)
+from tensorflow.keras import layers
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.callbacks import (
+    EarlyStopping,
+    ReduceLROnPlateau,
+    ModelCheckpoint,
+)
+
+# ==========================================================
+# SETTINGS
+# ==========================================================
+DATASET_PATH  = "dataset/cell_images"
+OUTPUT_PATH   = "outputs"
+
+IMG_SIZE      = (96, 96)
+BATCH_SIZE    = 16
+EPOCHS_STAGE1 = 10
+EPOCHS_STAGE2 = 6
+THRESHOLD     = 0.5
+SEED          = 42
+
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+tf.config.set_visible_devices([], "GPU")
+
+print("TensorFlow:", tf.__version__)
+print("Device: CPU (optimised for Windows / integrated graphics)")
+
+# ==========================================================
+# STRATIFIED SPLIT
+# ==========================================================
+dataset_dir = pathlib.Path(DATASET_PATH)
+class_dirs  = sorted([d for d in dataset_dir.iterdir() if d.is_dir()])
+class_names = [d.name for d in class_dirs]
+
+print("\nClasses:", class_names)
+
+EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
+
+train_paths, train_labels = [], []
+val_paths,   val_labels   = [], []
+
+for class_idx, class_dir in enumerate(class_dirs):
+    files = [
+        str(f) for f in class_dir.iterdir()
+        if f.suffix.lower() in EXTENSIONS
+    ]
+    random.shuffle(files)
+    cut = int(len(files) * 0.8)
+
+    train_paths  += files[:cut]
+    train_labels += [class_idx] * cut
+    val_paths    += files[cut:]
+    val_labels   += [class_idx] * (len(files) - cut)
+
+    print(f"  {class_dir.name:15s} -> {cut:5d} train | {len(files)-cut:4d} val")
+
+combined = list(zip(train_paths, train_labels))
+random.shuffle(combined)
+train_paths, train_labels = map(list, zip(*combined))
+
+combined = list(zip(val_paths, val_labels))
+random.shuffle(combined)
+val_paths, val_labels = map(list, zip(*combined))
+
+print(f"\nTotal -> {len(train_paths)} train | {len(val_paths)} val")
+
+for idx, name in enumerate(class_names):
+    count = val_labels.count(idx)
+    print(f"  Val '{name}': {count} samples")
+    if count == 0:
+        raise ValueError(f"Class '{name}' has 0 val samples! Check dataset folder.")
+
+# ==========================================================
+# tf.data PIPELINE
+# Images loaded as 0-255 float32.
+# Rescaling to 0-1 happens INSIDE the model (see below).
+# This way train, evaluate, and predict all stay consistent
+# as long as none of them divide by 255 before calling model.
+# ==========================================================
+AUTOTUNE = tf.data.AUTOTUNE
+
+def load_image(path, label):
+    raw = tf.io.read_file(path)
+    img = tf.image.decode_image(raw, channels=3, expand_animations=False)
+    img = tf.image.resize(img, IMG_SIZE)
+    img = tf.cast(img, tf.float32)   # 0-255, rescaling done inside model
+    return img, label
+
+train_ds = (
+    tf.data.Dataset.from_tensor_slices((train_paths, train_labels))
+    .map(load_image, num_parallel_calls=AUTOTUNE)
+    .cache()
+    .shuffle(buffer_size=2000, seed=SEED)
+    .batch(BATCH_SIZE)
+    .prefetch(AUTOTUNE)
+)
+
+val_ds = (
+    tf.data.Dataset.from_tensor_slices((val_paths, val_labels))
+    .map(load_image, num_parallel_calls=AUTOTUNE)
+    .cache()
+    .batch(BATCH_SIZE)
+    .prefetch(AUTOTUNE)
+)
+
+# ==========================================================
+# CLASS WEIGHTS
+# ==========================================================
+weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(train_labels),
+    y=train_labels,
+)
+class_weights = {int(i): float(w) for i, w in enumerate(weights)}
+print("\nClass weights:", class_weights)
+
+# ==========================================================
+# DATA AUGMENTATION
+# ==========================================================
+augment = tf.keras.Sequential([
+    layers.RandomFlip("horizontal_and_vertical"),
+    layers.RandomRotation(0.1),
+    layers.RandomZoom(0.1),
+    layers.RandomBrightness(0.1),
+], name="augmentation")
+
+# ==========================================================
+# MODEL — EfficientNetB0
+#
+# TF 2.15 does not support include_preprocessing=True.
+# Instead we add a Rescaling(1/255) layer manually inside
+# the model so the preprocessing is baked into the saved
+# model — predict.py and evaluate.py never need to rescale.
+# ==========================================================
+base_model = EfficientNetB0(
+    input_shape=(*IMG_SIZE, 3),
+    include_top=False,
+    weights="imagenet",
+    # include_preprocessing not available in TF 2.15
+)
+base_model.trainable = False
+
+inputs = tf.keras.Input(shape=(*IMG_SIZE, 3))
+x = augment(inputs)
+x = layers.Rescaling(1.0 / 255)(x)     # ← single rescale, inside model
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.4)(x)
+x = layers.Dense(128, activation="relu")(x)
+x = layers.Dropout(0.3)(x)
+outputs = layers.Dense(1, activation="sigmoid")(x)
+
+model = tf.keras.Model(inputs, outputs)
+model.summary()
+
+# ==========================================================
+# CALLBACKS
+# ==========================================================
+ckpt_path = os.path.join(OUTPUT_PATH, "best_model.keras")
+
+callbacks = [
+    EarlyStopping(monitor="val_loss", patience=4,
+                  restore_best_weights=True, verbose=1),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.4,
+                      patience=2, min_lr=1e-7, verbose=1),
+    ModelCheckpoint(filepath=ckpt_path, monitor="val_loss",
+                    save_best_only=True, verbose=1),
+]
+
+METRICS = [
+    "accuracy",
+    tf.keras.metrics.AUC(name="auc"),
+    tf.keras.metrics.Precision(name="precision"),
+    tf.keras.metrics.Recall(name="recall"),
+]
+
+# ==========================================================
+# STAGE 1 — FROZEN BACKBONE
+# ==========================================================
+print("\n" + "="*50)
+print("STAGE 1 — Frozen backbone")
+print("="*50)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-3),
+    loss="binary_crossentropy",
+    metrics=METRICS,
+)
+
+history1 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS_STAGE1,
+    class_weight=class_weights,
+    callbacks=callbacks,
+)
+
+# ==========================================================
+# STAGE 2 — FINE-TUNE TOP 20 LAYERS
+# ==========================================================
+print("\n" + "="*50)
+print("STAGE 2 — Fine-tuning top 20 layers")
+print("="*50)
+
+base_model.trainable = True
+for layer in base_model.layers[:-20]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(5e-6),
+    loss="binary_crossentropy",
+    metrics=METRICS,
+)
+
+history2 = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS_STAGE2,
+    class_weight=class_weights,
+    callbacks=callbacks,
+)
+
+# ==========================================================
+# PLOT TRAINING CURVES
+# ==========================================================
+def merge(h1, h2, key):
+    return h1.history.get(key, []) + h2.history.get(key, [])
+
+acc      = merge(history1, history2, "accuracy")
+val_acc  = merge(history1, history2, "val_accuracy")
+loss     = merge(history1, history2, "loss")
+val_loss = merge(history1, history2, "val_loss")
+auc_h    = merge(history1, history2, "auc")
+val_auc  = merge(history1, history2, "val_auc")
+boundary = len(history1.history["accuracy"])
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+for ax, train_v, val_v, title in zip(
+    axes,
+    [acc, loss, auc_h],
+    [val_acc, val_loss, val_auc],
+    ["Accuracy", "Loss", "AUC"],
+):
+    ax.plot(train_v, label="Train")
+    ax.plot(val_v,   label="Val")
+    ax.axvline(x=boundary - 0.5, color="gray",
+               linestyle="--", alpha=0.6, label="Stage 2")
+    ax.set_title(title)
+    ax.legend()
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, "training_curves.png"), dpi=150)
+plt.show()
+
+# ==========================================================
+# EVALUATION
+# ==========================================================
+print("\nGenerating predictions on validation set...")
+
+y_true, y_scores = [], []
+for images, labels_batch in val_ds:
+    preds = model.predict(images, verbose=0).flatten()
+    y_true.extend(labels_batch.numpy())
+    y_scores.extend(preds)
+
+y_true   = np.array(y_true)
+y_scores = np.array(y_scores)
+y_pred   = (y_scores >= THRESHOLD).astype(int)
+
+# Classification report
+report = classification_report(y_true, y_pred, target_names=class_names)
+print("\nClassification Report:\n", report)
+with open(os.path.join(OUTPUT_PATH, "classification_report.txt"), "w") as f:
+    f.write(report)
+
+# Confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=class_names, yticklabels=class_names)
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted"); plt.ylabel("Actual")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, "confusion_matrix.png"), dpi=150)
+plt.show()
+
+# ROC curve
+fpr, tpr, _ = roc_curve(y_true, y_scores)
+roc_auc = auc(fpr, tpr)
+plt.figure(figsize=(7, 5))
+plt.plot(fpr, tpr, linewidth=2, label=f"AUC = {roc_auc:.3f}")
+plt.plot([0,1],[0,1], linestyle="--", color="gray")
+plt.title("ROC Curve"); plt.xlabel("FPR"); plt.ylabel("TPR")
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, "roc_curve.png"), dpi=150)
+plt.show()
+
+# PR curve
+prec, rec, _ = precision_recall_curve(y_true, y_scores)
+plt.figure(figsize=(7, 5))
+plt.plot(rec, prec, linewidth=2)
+plt.title("Precision-Recall Curve"); plt.xlabel("Recall"); plt.ylabel("Precision")
+plt.grid(True); plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, "pr_curve.png"), dpi=150)
+plt.show()
+
+# Sample predictions
+plt.figure(figsize=(12, 12))
+for images, labels_batch in val_ds.take(1):
+    preds = model.predict(images, verbose=0).flatten()
+    for i in range(min(9, len(images))):
+        plt.subplot(3, 3, i + 1)
+        plt.imshow(images[i].numpy().astype("uint8"))
+        pred_label   = class_names[1] if preds[i] >= THRESHOLD else class_names[0]
+        actual_label = class_names[int(labels_batch[i])]
+        color = "green" if pred_label == actual_label else "red"
+        plt.title(f"P: {pred_label}\nA: {actual_label}\n({preds[i]:.2f})",
+                  fontsize=8, color=color)
+        plt.axis("off")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_PATH, "sample_predictions.png"), dpi=150)
+plt.show()
+
+print("\n" + "="*50)
+print("Training complete!")
+print(f"Val AUC      -> {roc_auc:.4f}")
+print(f"Best model   -> {ckpt_path}")
+print("All outputs  -> outputs/")
+print("="*50)
